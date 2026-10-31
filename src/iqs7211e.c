@@ -384,7 +384,10 @@ static void iqs7211e_wait_for_ready(const struct device *dev, uint16_t timeout_m
 }
 
 static int iqs7211e_get_base_data(const struct device *dev, azoteq_iqs7211e_base_data_t *base_data) {
-    uint8_t transfer_bytes[8];
+    // 0x0F info flags, 0x10-0x13 finger 1 (X, Y, strength, area),
+    // 0x14-0x15 finger 2 (X, Y). Read everything in one burst so that both
+    // fingers come from the same communication window.
+    uint8_t transfer_bytes[14];
     int ret;
     
     iqs7211e_wait_for_ready(dev, 50);
@@ -394,7 +397,7 @@ static int iqs7211e_get_base_data(const struct device *dev, azoteq_iqs7211e_base
         return -EIO;
     }
     
-    ret = iqs7211e_i2c_read_reg(dev, IQS7211E_MM_INFO_FLAGS, transfer_bytes, 8);
+    ret = iqs7211e_i2c_read_reg(dev, IQS7211E_MM_INFO_FLAGS, transfer_bytes, 14);
     if (ret < 0) {
         return ret;
     }
@@ -405,8 +408,10 @@ static int iqs7211e_get_base_data(const struct device *dev, azoteq_iqs7211e_base
     base_data->finger_1_x.h = transfer_bytes[3];
     base_data->finger_1_y.l = transfer_bytes[4];
     base_data->finger_1_y.h = transfer_bytes[5];
-    base_data->finger_2_x.l = transfer_bytes[6];
-    base_data->finger_2_x.h = transfer_bytes[7];
+    base_data->finger_2_x.l = transfer_bytes[10];
+    base_data->finger_2_x.h = transfer_bytes[11];
+    base_data->finger_2_y.l = transfer_bytes[12];
+    base_data->finger_2_y.h = transfer_bytes[13];
     
     return 0;
 }
@@ -721,6 +726,24 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
             data->scroll_was_active = false;
             data->gesture_started_near_edge = iqs7211e_is_near_edge(data, finger_1_x, finger_1_y);
             data->scroller_axis_lock = IQS7211E_SCROLL_AXIS_NONE;
+
+            // Tap-and-drag: a touch that starts shortly after a tap presses the
+            // button while the finger is down. Lifting quickly gives a double
+            // click; moving before lifting drags. The button is always released
+            // when the finger lifts, so it can never stay stuck.
+            if (data->tap_count == 1 && !data->gesture_started_near_edge &&
+                (current_time - data->last_tap_time) < 400) {
+                if (data->pending_click_type == 1) {
+                    k_work_cancel_delayable(&data->click_work);
+                    input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+                    data->pending_click_type = 0;
+                }
+                LOG_DBG("Tap-and-drag - press");
+                input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
+                data->double_tap_hold = true;
+                data->is_clicking = true;
+                data->tap_count = 0;
+            }
         } else if (data->finger_2_prev_valid) {
             // Transitioning from two finger to one finger - reset position reference
             LOG_DBG("Transition from two finger to one finger - reset position");
@@ -759,11 +782,7 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
         uint16_t finger_1_x = AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(base_data.finger_1_x.h, base_data.finger_1_x.l);
         uint16_t finger_1_y = AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(base_data.finger_1_y.h, base_data.finger_1_y.l);
         uint16_t finger_2_x = AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(base_data.finger_2_x.h, base_data.finger_2_x.l);
-        
-        // Read finger 2 Y coordinate (need additional read)
-        uint8_t finger_2_y_bytes[2];
-        ret = iqs7211e_i2c_read_reg(dev, IQS7211E_MM_FINGER_2_Y, finger_2_y_bytes, 2);
-        uint16_t finger_2_y = (ret == 0) ? AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(finger_2_y_bytes[1], finger_2_y_bytes[0]) : 0;
+        uint16_t finger_2_y = AZOTEQ_IQS7211E_COMBINE_H_L_BYTES(base_data.finger_2_y.h, base_data.finger_2_y.l);
         
         if (!data->finger_2_prev_valid) {
             // Two finger touch start
@@ -839,32 +858,20 @@ static void iqs7211e_motion_work_handler(struct k_work *work) {
 
                 LOG_DBG("Touch duration: %lld ms, tap distance: %d, tap count: %d", touch_duration, tap_distance, data->tap_count);
                 
-                if (tap_allowed && touch_duration < 200 && tap_distance < 50) { // Quick tap with minimal movement
-                    int64_t tap_interval = current_time - data->last_tap_time;
-                    
-                    if (tap_interval < 400 && data->tap_count == 1) { // Double tap
-                        LOG_DBG("Double tap - start hold click");
-                        data->double_tap_hold = true;
-                        data->is_clicking = true;
-                        input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
-                        data->tap_count = 0;
-                    } else {
-                        // Single tap
-                        if (!data->double_tap_hold) {
-                            LOG_DBG("Single tap - press");
-                            input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
-                            data->pending_click_type = 1;
-                            k_work_schedule(&data->click_work, K_MSEC(50));
-                        }
-                        data->tap_count = 1;
-                    }
-                    data->last_tap_time = current_time;
-                } else if (data->double_tap_hold && data->is_clicking) {
-                    // Release double-tap hold
-                    LOG_DBG("Release double tap hold");
+                if (data->double_tap_hold && data->is_clicking) {
+                    // End of tap-and-drag (or second click of a double click)
+                    LOG_DBG("Tap-and-drag - release");
                     data->double_tap_hold = false;
                     data->is_clicking = false;
                     input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+                    data->tap_count = 0;
+                } else if (tap_allowed && touch_duration < 200 && tap_distance < 50) { // Quick tap with minimal movement
+                    LOG_DBG("Single tap - press");
+                    input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
+                    data->pending_click_type = 1;
+                    k_work_schedule(&data->click_work, K_MSEC(50));
+                    data->tap_count = 1;
+                    data->last_tap_time = current_time;
                 } else if (!tap_allowed) {
                     LOG_DBG("Single finger tap ignored near sensor edge");
                     data->tap_count = 0;
